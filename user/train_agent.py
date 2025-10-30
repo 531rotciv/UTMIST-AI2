@@ -1,4 +1,4 @@
-'''
+﻿'''
 TRAINING: AGENT
 
 This file contains all the types of Agent classes, the Reward Function API, and the built-in train function from our multi-agent RL API for self-play training.
@@ -406,7 +406,38 @@ def damage_interaction_reward(
     return reward / 140
 
 
-# In[ ]:
+# What happens if opponent is above player? They might attack and wiff if they don't take that into account
+# also if opponent is directly above player my if condition breaks
+
+def attack_proximity_reward(
+    env: WarehouseBrawl,
+    desired_state: Type[PlayerObjectState] = AttackState,
+    close_threshold: float = 1.0,
+    far_penalty: float = -0.5,
+) -> float:
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    p_facing_dir = player.facing
+    opp_facing_dir = opponent.facing
+    # Direction player ↔ opponent
+    direction_to_player = np.sign(player.body.position.x - opponent.body.position.x)
+    direction_to_opp = -direction_to_player  # Opposite direction
+
+    # Compute 2D distance
+    distance = np.linalg.norm(
+        np.array([player.body.position.x, player.body.position.y]) -
+        np.array([opponent.body.position.x, opponent.body.position.y])
+    )
+
+    # Reward logic
+    if isinstance(player.state, desired_state) and (p_facing_dir==direction_to_opp or direction_to_opp==0):
+        reward = 1.0 if distance <= close_threshold else far_penalty
+    else:
+        reward = 0.0
+
+    return reward * env.dt
+
+    
 
 
 def danger_zone_reward(
@@ -532,32 +563,125 @@ def on_drop_reward(env: WarehouseBrawl, agent: str) -> float:
             return -1.0
     return 0.0
 
+def holding_weapon_reward(env: WarehouseBrawl, agent: str="player") -> float:
+    if agent == "player" and env.objects["player"].weapon != "Punch":
+        return 1.0 * env.dt  # small steady positive
+    return 0.0
+
 def on_combo_reward(env: WarehouseBrawl, agent: str) -> float:
     if agent == 'player':
         return -1.0
     else:
         return 1.0
 
+def over_stable_ground(env: WarehouseBrawl) -> float:
+    player = env.objects["player"]
+    if (player.body.position.x > 2.0 and player.body.position.x < 7.0) and player.body.position.y <0.85:
+        return 1.0* env.dt
+    elif (player.body.position.x > -7.0 and player.body.position.x < -2.0) and player.body.position.y < 2.85:
+        return 1.0* env.dt
+    elif (player.body.position.x < env.objects['platform1'].body.position.x+0.9 and player.body.position.x > env.objects['platform1'].body.position.x-0.9) and player.body.position.y < env.objects['platform1'].body.position.y:
+        return 0.0* env.dt
+    else:
+        return -1.0* env.dt
+
+def avoid_attack_reward(env: WarehouseBrawl) -> float:
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+    p_facing_dir = player.facing
+    opp_facing_dir = opponent.facing
+
+    # Distance between player and opponent
+    distance = np.linalg.norm(
+        np.array([player.body.position.x, player.body.position.y]) -
+        np.array([opponent.body.position.x, opponent.body.position.y])
+    )
+
+    # Direction player ↔ opponent
+    direction_to_player = np.sign(player.body.position.x - opponent.body.position.x)
+    direction_to_opp = -direction_to_player  # Opposite direction
+
+    # Only trigger when opponent is attacking and facing the player
+    if isinstance(opponent.state, AttackState) and opp_facing_dir == direction_to_player:
+        # Reward if player backdashes *away* while close
+        if isinstance(player.state, BackDashState) and p_facing_dir == direction_to_opp and distance <= 1.0:
+            return 1.0* env.dt
+        elif p_facing_dir == -direction_to_opp and distance <= 1.0 and isinstance(player.state,DashState):
+            return 1.0* env.dt
+        # Small penalty if standing still or moving into danger
+        elif distance <= 1.0 and isinstance(player.state,StandingState):
+            return -1.0* env.dt
+        else:
+            return 0.0* env.dt  # Out of range — neutral
+    else:
+        return 0.0* env.dt  # No attack happening — no reward
+
+
+def stage_control_reward(env: WarehouseBrawl) -> float:
+    player = env.objects["player"]
+    opponent = env.objects["opponent"]
+
+    # Define platforms: (x_min, x_max, y)
+    platforms = [
+        {"x_min": -7.0, "x_max": -2.0, "y": 2.85},  # Ground1
+        {"x_min":  2.0, "x_max":  7.0, "y": 0.85},  # Ground2
+    ]
+
+    reward = 0.0
+
+    for plat in platforms:
+        x_min, x_max, y = plat["x_min"], plat["x_max"], plat["y"]
+
+        # Check if both player and opponent are on this platform (within bounds)
+        on_platform_player = (x_min <= player.body.position.x <= x_max) and (abs(player.body.position.y - y) < 0.5)
+        on_platform_opp = (x_min <= opponent.body.position.x <= x_max) and (abs(opponent.body.position.y - y) < 0.5)
+
+        if on_platform_player and on_platform_opp:
+            center_x = (x_min + x_max) / 2
+            dist_player = abs(player.body.position.x - center_x)
+            dist_opp = abs(opponent.body.position.x - center_x)
+
+            if dist_player < dist_opp:
+                reward = 1.0  # player closer to center
+            elif dist_player > dist_opp:
+                reward = -1.0  # opponent closer to center
+            else:
+                reward = 0.0  # tied
+
+            break  # only check one platform at a time
+
+    return reward * env.dt
+
+
+
+
+
+
 '''
 Add your dictionary of RewardFunctions here using RewTerms
 '''
 def gen_reward_manager():
+    # Start with few basic reward functions, consider adding more later
     reward_functions = {
         #'target_height_reward': RewTerm(func=base_height_l2, weight=0.0, params={'target_height': -4, 'obj_name': 'player'}),
         'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0),
-        #'head_to_middle_reward': RewTerm(func=head_to_middle_reward, weight=0.01),
-        #'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.05),
-        'penalize_attack_reward': RewTerm(func=in_state_reward, weight=-0.04, params={'desired_state': AttackState}),
+        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0,params={'mode':RewardMode.SYMMETRIC}),
+        'over_stable_ground': RewTerm(func=over_stable_ground, weight=0.3),
+        #'avoid_attack_reward': RewTerm(func=avoid_attack_reward, weight=0.1),
+        #'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.05),
+        'holding_weapon_reward': RewTerm(func=holding_weapon_reward, weight=0.05),
+        'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.1),
+        #'attack_proximity_reward': RewTerm(func=attack_proximity_reward, weight=0.5, params={'desired_state': AttackState}),
         'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.01),
+        # 'recovery_reward': RewTerm(func=recovery_reward, weight=0.2),
         #'taunt_reward': RewTerm(func=in_state_reward, weight=0.2, params={'desired_state': TauntState}),
     }
     signal_subscriptions = {
         'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=50)),
-        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=8)),
+        'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=15)),
         'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=5)),
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=10)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=15))
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=5)),
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=10))
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -569,13 +693,14 @@ The main function runs training. You can change configurations such as the Agent
 '''
 if __name__ == '__main__':
     # Create agent
-    my_agent = CustomAgent(sb3_class=PPO, extractor=MLPExtractor)
+    #my_agent = CustomAgent(sb3_class=PPO, extractor=MLPExtractor)
 
     # Start here if you want to train from scratch. e.g:
-    #my_agent = RecurrentPPOAgent()
+    my_agent = RecurrentPPOAgent()
 
     # Start here if you want to train from a specific timestep. e.g:
-    #my_agent = RecurrentPPOAgent(file_path='checkpoints/experiment_3/rl_model_120006_steps.zip')
+
+    #my_agent = RecurrentPPOAgent(file_path="checkpoints/experiment_1_f/rl_model_1080000_steps")
 
     # Reward manager
     reward_manager = gen_reward_manager()
@@ -589,9 +714,10 @@ if __name__ == '__main__':
     save_handler = SaveHandler(
         agent=my_agent, # Agent to save
         save_freq=100_000, # Save frequency
-        max_saved=40, # Maximum number of saved models
+        max_saved=40, # Maximum number of saved modelsf
         save_path='checkpoints', # Save path
-        run_name='experiment_9',
+        run_name='experiment_1_g',
+        name_prefix='rl_model', # File name prefix
         mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
     )
 
@@ -608,6 +734,6 @@ if __name__ == '__main__':
         save_handler,
         opponent_cfg,
         CameraResolution.LOW,
-        train_timesteps=1_000_000_000,
+        train_timesteps=4_000_000, #defaulted to 1_000_000_000 but I've lowered to 1 million for quicker testing
         train_logging=TrainLogging.PLOT
     )
