@@ -13,6 +13,7 @@ b) Continue training from a specific timestep given an input `file_path`
 # ----------------------------- IMPORTS -----------------------------
 # -------------------------------------------------------------------
 
+from numpy._core.defchararray import lower
 import torch 
 import gymnasium as gym
 from torch.nn import functional as F
@@ -100,16 +101,47 @@ class RecurrentPPOAgent(Agent):
                 'share_features_extractor': True,
 
             }
+            def lr_schedule(progress_remaining: float) -> float:
+                # Convert progress_remaining to current timestep
+                timestep = (1 - progress_remaining) * 6_000_000
+
+                if timestep < 2_000_000:
+                    return 0.0003  # constant for first 2M timesteps
+                else:
+                    # linear decay from initial_lr → final_lr after delay
+                    remaining_after_delay = (timestep - 2_000_000) / (6_000_000 - 2_000_000)
+                    return 0.0003 - (0.0003 - 0.0001) * remaining_after_delay
+
+            def ent_coef_schedule(progress_remaining: float) -> float:
+                # Convert progress_remaining to current timestep
+                timestep = (1 - progress_remaining) * 6_000_000
+    
+                if timestep < 2_000_000:
+                    return 0.05  # constant value for first 2M timesteps
+                else:
+                    # linear decay from 0.05 → 0.02 after 2M timesteps
+                    remaining_after_delay = (timestep - 2_000_000) / (6_000_000 - 2_000_000)
+                    return 0.05 - (0.05 - 0.02) * remaining_after_delay
+            
             self.model = RecurrentPPO("MlpLstmPolicy",
                                       self.env,
                                       verbose=0,
-                                      n_steps=30*90*20,
-                                      batch_size=16,
+                                      n_steps=4196,
+                                      #learning_rate=0.0003,
+                                      batch_size=256,
                                       ent_coef=0.05,
                                       policy_kwargs=policy_kwargs)
             del self.env
         else:
-            self.model = RecurrentPPO.load(self.file_path)
+            custom_objects = { 'learning_rate': 0.0003, 'ent_coef':0.03}
+            self.model = RecurrentPPO.load(self.file_path, custom_objects=custom_objects)
+            with torch.no_grad():
+                self.model.policy.log_std[:] = torch.clamp(self.model.policy.log_std, min=-3.0, max=1.0)
+            #self.model.learning_rate = 0.00015 # set to 0.0005 for baseline 2_g 0.0002 for 2_f 
+            #self.model.lr_schedule = lambda _: self.model.learning_rate
+            self.model.clip_range = lambda _: 0.2 # set to 0.3 for 2_g 0.2 for 2_f
+            #self.model.ent_coef = 0.02 # set to 0.03 for experiment 2_e 0.02 for 2_f
+            #self.model.vf_coef = 0.5 # set to 0.5 for experiment 2_e 0.7 for 2_f
 
     def reset(self) -> None:
         self.episode_starts = True
@@ -510,19 +542,36 @@ def head_to_middle_reward(
 
     return reward
 
-def head_to_opponent(
-    env: WarehouseBrawl,
-) -> float:
+import numpy as np
 
-    # Get player object from the environment
+def head_to_opponent(env: WarehouseBrawl) -> float:
+    """
+    Rewards the player for moving closer to the opponent
+    based on Euclidean distance in the x-y plane.
+    """
+
     player: Player = env.objects["player"]
     opponent: Player = env.objects["opponent"]
+    if (opponent.body.position.x > 2.0 and player.body.position.x < 7.0) or (opponent.body.position.x < -2.0 and opponent.body.position.x >-7.0):
+        # Current positions
+        player_pos = np.array([player.body.position.x, player.body.position.y])
+        opponent_pos = np.array([opponent.body.position.x, opponent.body.position.y])
 
-    # Apply penalty if the player is in the danger zone
-    multiplier = -1 if player.body.position.x > opponent.body.position.x else 1
-    reward = multiplier * (player.body.position.x - player.prev_x)
+        # Previous positions (you'll need to ensure these are updated each step)
+        player_prev = np.array([player.prev_x, player.prev_y])
+        opponent_prev = np.array([opponent.prev_x, opponent.prev_y])
 
-    return reward
+        # Compute distances
+        prev_dist = np.linalg.norm(player_prev - opponent_prev)
+        curr_dist = np.linalg.norm(player_pos - opponent_pos)
+
+        # Reward for reducing distance
+        reward = prev_dist - curr_dist
+
+        return reward
+    else:
+        return 0.0
+
 
 def holding_more_than_3_keys(
     env: WarehouseBrawl,
@@ -576,14 +625,73 @@ def on_combo_reward(env: WarehouseBrawl, agent: str) -> float:
 
 def over_stable_ground(env: WarehouseBrawl) -> float:
     player = env.objects["player"]
-    if (player.body.position.x > 2.0 and player.body.position.x < 7.0) and player.body.position.y <0.85:
+    if (player.body.position.x > 2.2 and player.body.position.x < 6.8) and player.body.position.y <0.85:
         return 1.0* env.dt
-    elif (player.body.position.x > -7.0 and player.body.position.x < -2.0) and player.body.position.y < 2.85:
+    elif (player.body.position.x > -6.8 and player.body.position.x < -2.2) and player.body.position.y < 2.85:
         return 1.0* env.dt
     elif (player.body.position.x < env.objects['platform1'].body.position.x+0.9 and player.body.position.x > env.objects['platform1'].body.position.x-0.9) and player.body.position.y < env.objects['platform1'].body.position.y:
         return 0.0* env.dt
+    elif (2.0 <= player.body.position.x <= 2.2) and player.body.position.y <0.85:
+        return ((player.body.position.x-2.0)/0.2)* env.dt
+    elif (6.8 <= player.body.position.x <= 7.0) and player.body.position.y <0.85:
+        return ((7.0-player.body.position.x)/0.2)* env.dt
+    elif (-2.2 <= player.body.position.x <= -2.0) and player.body.position.y <0.85:
+        return ((-2.0-player.body.position.x)/0.2)* env.dt
+    elif (-7.0 <= player.body.position.x <= -6.8) and player.body.position.y <0.85:
+        return ((7.0+player.body.position.x)/0.2)* env.dt
     else:
+        return 0.0* env.dt
+
+def recovery_reward(env: WarehouseBrawl) -> float:
+    player = env.objects["player"]
+    if (player.body.position.x < env.objects['platform1'].body.position.x+0.9 and player.body.position.x > env.objects['platform1'].body.position.x-0.9) and player.body.position.y < env.objects['platform1'].body.position.y:
+        return 0.0* env.dt
+    elif 0.5<= player.body.position.x <= 2.2: # off-stage and not on the moving platform but near edge
+        # Stage edge coordinates
+        edge_x, edge_y = 2.2, 0.37
+        # Euclidean distance to edge
+        dist = np.sqrt((edge_x - player.body.position.x)**2 + (edge_y - player.body.position.y)**2)
+        max_dist = 2.0  # 2.0 units away gives max penalty
+        max_penalty = 0.5
+        # Linearly scale from 0 at the edge to -max_penalty at max_dist
+        scaled_penalty = -max_penalty * min((dist / max_dist)**2,1.0) * env.dt
+        return scaled_penalty # edit this to be some function of distance later with 0 distance being 0 penalty and 1.0 distance being max penalty
+    elif -2.0<= player.body.position.x <= -0.5: # off-stage and not on the moving platform but near edge
+        # Stage edge coordinates
+        edge_x, edge_y = -2.2, 2.37
+        # Euclidean distance to edge
+        dist = np.sqrt((edge_x - player.body.position.x)**2 + (edge_y - player.body.position.y)**2)
+        max_dist = 2.0  # 2 units away gives max penalty
+        max_penalty = 0.5
+        # Linearly scale from 0 at the edge to -max_penalty at max_dist
+        scaled_penalty = -max_penalty * min((dist / max_dist)**2,1.0) * env.dt
+        return scaled_penalty
+    elif -8.5 <= player.body.position.x <= -6.8: # off-stage and not on the moving platform but near edge
+        # Stage edge coordinates
+        edge_x, edge_y = -6.8, 2.37
+        # Euclidean distance to edge
+        dist = np.sqrt((edge_x - player.body.position.x)**2 + (edge_y - player.body.position.y)**2)
+        max_dist = 2.0  # 2 units away gives max penalty
+        max_penalty = 1.0
+        # Linearly scale from 0 at the edge to -max_penalty at max_dist
+        scaled_penalty = -max_penalty * min((dist / max_dist)**2,1.0) * env.dt
+        return scaled_penalty
+    elif 6.8<= player.body.position.x <= 8.5: # off-stage and not on the moving platform but near edge
+        # Stage edge coordinates
+        edge_x, edge_y = 6.8, 0.37
+        # Euclidean distance to edge
+        dist = np.sqrt((edge_x - player.body.position.x)**2 + (edge_y - player.body.position.y)**2)
+        max_dist = 2.0  # 2 units away gives max penalty
+        max_penalty = 1.0
+        # Linearly scale from 0 at the edge to -max_penalty at max_dist
+        scaled_penalty = -max_penalty * min((dist / max_dist)**2,1.0) * env.dt
+        return scaled_penalty
+    elif -0.5 < player.body.position.x < 0.5: 
+        return -0.5* env.dt
+    elif player.body.position.x < -8.5 or player.body.position.x > 8.5: # over the pit
         return -1.0* env.dt
+    else: 
+        return 0.0* env.dt
 
 def avoid_attack_reward(env: WarehouseBrawl) -> float:
     player = env.objects["player"]
@@ -653,10 +761,6 @@ def stage_control_reward(env: WarehouseBrawl) -> float:
     return reward * env.dt
 
 
-
-
-
-
 '''
 Add your dictionary of RewardFunctions here using RewTerms
 '''
@@ -664,24 +768,25 @@ def gen_reward_manager():
     # Start with few basic reward functions, consider adding more later
     reward_functions = {
         #'target_height_reward': RewTerm(func=base_height_l2, weight=0.0, params={'target_height': -4, 'obj_name': 'player'}),
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.5),
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.0,params={'mode':RewardMode.SYMMETRIC}),
-        'over_stable_ground': RewTerm(func=over_stable_ground, weight=0.3),
-        #'avoid_attack_reward': RewTerm(func=avoid_attack_reward, weight=0.1),
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=1.0),
+        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=1.5,params={'mode':RewardMode.SYMMETRIC}),
+        'over_stable_ground': RewTerm(func=over_stable_ground, weight=0.9),
+        # 'avoid_attack_reward': RewTerm(func=avoid_attack_reward, weight=0.25), We'll figure this out later
         #'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.05),
-        'holding_weapon_reward': RewTerm(func=holding_weapon_reward, weight=0.05),
-        'head_to_opponent': RewTerm(func=head_to_opponent, weight=0.1),
+        'holding_weapon_reward': RewTerm(func=holding_weapon_reward, weight=0.20),
+        'head_to_opponent': RewTerm(func=head_to_opponent, weight=1.1),
+        'recovery_reward': RewTerm(func=recovery_reward, weight=0.9),
         #'attack_proximity_reward': RewTerm(func=attack_proximity_reward, weight=0.5, params={'desired_state': AttackState}),
         'holding_more_than_3_keys': RewTerm(func=holding_more_than_3_keys, weight=-0.01),
-        # 'recovery_reward': RewTerm(func=recovery_reward, weight=0.2),
+        # 'recovery_reward': RewTerm(func=recovery_reward, weight=0.5),
         #'taunt_reward': RewTerm(func=in_state_reward, weight=0.2, params={'desired_state': TauntState}),
     }
     signal_subscriptions = {
         'on_win_reward': ('win_signal', RewTerm(func=on_win_reward, weight=50)),
         'on_knockout_reward': ('knockout_signal', RewTerm(func=on_knockout_reward, weight=15)),
         'on_combo_reward': ('hit_during_stun', RewTerm(func=on_combo_reward, weight=5)),
-        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=5)),
-        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=10))
+        'on_equip_reward': ('weapon_equip_signal', RewTerm(func=on_equip_reward, weight=4)),
+        'on_drop_reward': ('weapon_drop_signal', RewTerm(func=on_drop_reward, weight=8))
     }
     return RewardManager(reward_functions, signal_subscriptions)
 
@@ -696,11 +801,11 @@ if __name__ == '__main__':
     #my_agent = CustomAgent(sb3_class=PPO, extractor=MLPExtractor)
 
     # Start here if you want to train from scratch. e.g:
-    my_agent = RecurrentPPOAgent()
+    #my_agent = RecurrentPPOAgent()
 
     # Start here if you want to train from a specific timestep. e.g:
 
-    #my_agent = RecurrentPPOAgent(file_path="checkpoints/experiment_1_f/rl_model_1080000_steps")
+    my_agent = RecurrentPPOAgent(file_path="checkpoints\\experiment7\\rl_model_6146034_steps")
 
     # Reward manager
     reward_manager = gen_reward_manager()
@@ -716,9 +821,9 @@ if __name__ == '__main__':
         save_freq=100_000, # Save frequency
         max_saved=40, # Maximum number of saved modelsf
         save_path='checkpoints', # Save path
-        run_name='experiment_1_g',
+        run_name='experiment7',
         name_prefix='rl_model', # File name prefix
-        mode=SaveHandlerMode.FORCE # Save mode, FORCE or RESUME
+        mode=SaveHandlerMode.RESUME # Save mode, FORCE or RESUME
     )
 
     # Set opponent settings here:
@@ -734,6 +839,6 @@ if __name__ == '__main__':
         save_handler,
         opponent_cfg,
         CameraResolution.LOW,
-        train_timesteps=4_000_000, #defaulted to 1_000_000_000 but I've lowered to 1 million for quicker testing
+        train_timesteps=2_000_000, #defaulted to 1_000_000_000 but I've lowered to 1 million for quicker testing
         train_logging=TrainLogging.PLOT
     )
